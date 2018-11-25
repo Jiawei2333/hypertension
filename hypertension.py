@@ -4,49 +4,46 @@ from datetime import datetime, timedelta
 from dateutil.parser import parse
 import os
 
-# Define a "hypertensive index" which classify blood pressure as 1 if pressure > 180/110, else 0
-def hyperten_index(df):
-    hyperten_label = [1 if value1 >= hyperten_threshold_high or value2 >= hyperten_threshold_low else 0
-                    for value1, value2 in zip(df['Pressure_high'], df['Pressure_low'])]
-    str_hyperten = ''.join(str(entry) for entry in hyperten_label)
-    return hyperten_label, str_hyperten
+# bp: blood pressure as a DataFrame with the 1st column as systolic bp and 2nd column as diastolic bp
+# by = 'each' checks every instance of bp
+# by = 'mean' calculates and checks the mean of bp
+def is_high_reading(bp, systolic_threshold = 180, diastolic_threshold = 110, by = 'each'):
+    if by == 'each':
+        is_systolic_high = bp['systolic_bp'] > systolic_threshold
+        is_diastolic_high = bp['diastolic_bp'] > diastolic_threshold
+    if by == 'mean':
+        mean = bp.mean()
+        is_systolic_high = mean['systolic_bp'] > systolic_threshold
+        is_diastolic_high = mean['diastolic_bp'] > diastolic_threshold
+    return is_systolic_high or is_diastolic_high
 	
 # Hypertensive emergency alert
-def hyperten_emergency(df, str_hyperten):
-    hyperten_idx = 0  # hyperten_idx is the index of '111' in str_hyperten
-    df_pointer = 0    # df_pointer "memorize" the real index in the original df
-    while len(str_hyperten) > 0:
-        hyperten_idx = str_hyperten.find('111') # Find if 3 consecutive readings are > 180/110
-        if hyperten_idx == -1: # No hypertensive emergency, break the while loop
-            break
-        else:
-            df_pointer += hyperten_idx   # Find '111', move df_pointer to the hyperten_idx position
-            # Check whether the consecutive 3 readings are within 1 hour
-            time_start, time_end = df.iloc[df_pointer]['TimeStamp'], df.iloc[df_pointer + 2]['TimeStamp']
-            time_delta = time_end - time_start
-            # If the consecutive 3 readings are within 1 hour, check the remaining readings
-            # If any of the reading is 0, alert[0] should be kept as 0
-            # if all following readings are 1, raise hypertensive emergency alert
-            if time_delta < timedelta(hours = 1) and str_hyperten[hyperten_idx:].find('0') == -1:
-                # Raised hypertensive emergency alert
-                return True
-            # hypertensive emergency alert is nullified, check the rest of the str_hyperten
-            str_hyperten = str_hyperten[hyperten_idx + 1:]
-            df_pointer += 1
-    
-    return False # No hypertensive emergency
-	
-# Monthly high alert
-def monthly_high(df):
-    df_pressure = df[['Pressure_high', 'Pressure_low']]
-    mean = df_pressure.mean()
-    # Check if last month average is more than 140/90
-    if mean['Pressure_high'] >= monthly_threshold_high or mean['Pressure_low'] >= monthly_threshold_low:
-        return True
+def hyperten_emergency(df, alerts = [0, 0, 0]):
+    idx = len(df)-1 # initialize index pointing to the last bp instance
+    if is_high_reading(df.iloc[idx]):
+        # if the current instance is high reading, check the previous 2 readings
+        if idx > 1 and is_high_reading(df.iloc[idx -1]) and is_high_reading(df.iloc[idx -2]):
+            timegap = df.iloc[idx]['TimeStamp'] - df.iloc[idx - 2]['TimeStamp']
+            # if previous 2 readings are high and within 1 hour, raise hyperten emergency alert
+            if timegap < timedelta(hours = 1):
+                alerts[0] = 1
+        # if no hyperten emergency alert is raised, check if there is no follow up after high reading
+        elif datetime.now() - df.iloc[idx]['TimeStamp'] > timedelta(hours = 1):
+            alerts[2] = 1
+    # if the current instance is low reading,
+    # check the previous readings to see if there is 'miss reading' for no follow up
     else:
-        return False
+        while idx > 0:
+            next_time = df.iloc[idx]['TimeStamp']
+            idx -= 1
+            if is_high_reading(df.iloc[idx]):
+                timegap = next_time - df.iloc[idx]['TimeStamp']
+                if timegap > timedelta(hours = 1):
+                    alerts[2] = 1
+    return alerts
+
 		
-# Missed reading alert (1)
+# Missed reading alert
 # Any time there is a gap of 7 days in readings of last month
 def gap_7days(df):
     for i in range(len(df)-1): # Iterate over all the instances except the last one
@@ -55,27 +52,12 @@ def gap_7days(df):
         # Any time there is a gap of 7 days in readings of last month,
         # raise missed reading alert, and break the for loop
         if gap_7 > timedelta(days = 7):
-            return True
-    return False
+            return 'miss reading'
 	
-# Missed reading alert (2)
-# No follow-up within an hour after 180/110
-def no_follow_up(df, hyperten_label):
-    for j in range(len(hyperten_label)):
-        if hyperten_label[j] == 1: 
-            # If a reading is > 180/110 and it is the last reading (no following up)
-            # Raise missed reading alert
-            if j == len(hyperten_label):
-                return True
-            else:
-                time_hyperten, next_time = df.iloc[j]['TimeStamp'], df.iloc[j + 1]['TimeStamp']
-                time_gap = next_time - time_hyperten
-                if time_gap > timedelta(hours = 1): # No follow-up within an hour after 180/110, 
-                    return True # raise missed reading alert, and break the for loop
-    return False
+
 	
 # Main function
-def raise_alerts(df, ID):
+def hypertension_alerts(df, ID):
     '''
     A function that takes in an id and DataFrame file, and returns the following:
 
@@ -88,20 +70,29 @@ def raise_alerts(df, ID):
         a. Any time there is a gap of 7 days in readings of last month. 
         b. No follow-up within an hour after 180/110
     '''
-    df_ID = df[df['ID'] == ID]
-    hyperten_label, str_hyperten = hyperten_index(df_ID)
-    print(hyperten_label, str_hyperten)
-    if hyperten_emergency(df_ID, str_hyperten):
-        alerts[0] = 1
-    # Filter the df data and get the readings from last month: df_last_mo
-    now = datetime.now()
-    last_month = now.month - 1
-    mask = [True if time.month == last_month else False for time in df_ID['TimeStamp']]
-    df_last_mo = df_ID.loc[mask]
-    if monthly_high(df_last_mo):
+    # alerts[0]: hypertensive emergency
+    # alerts[1]: monthly high
+    # alerts[2]: missed reading
+    alerts = [0, 0, 0] # Inicialize alerts. 0 stands for no alert while 1 stands for alert
+    
+    df_ID = df[df['ID'] == ID] # Pick up the df for patient with given ID
+    # Choose the data from last month
+    mask = df_ID['TimeStamp'] > datetime.now() - timedelta(days = 30)
+    df_last_mo = df_ID[mask]
+    # Check if monthly high
+    is_monthly_high = is_high_reading(df_last_mo[['systolic_bp', 'diastolic_bp']],
+                                      systolic_threshold = 140,
+                                      diastolic_threshold = 90,
+                                      by = 'mean')
+    if is_monthly_high:
         alerts[1] = 1
-    if gap_7days(df_last_mo) or no_follow_up(df_ID, hyperten_label):
+
+    # Check hypertensive emergency or miss reading
+    alerts = hyperten_emergency(df_ID, alerts)
+
+    if gap_7days(df_last_mo) == 'miss reading':
         alerts[2] = 1
+    
     return alerts
 	
 	
@@ -114,20 +105,10 @@ df = pd.read_csv(os.path.join(path, 'blood_pressure.csv'))
 df['TimeStamp'] = df['TimeStamp'].map(lambda x: parse(x, dayfirst = True))
 
 split_values = df['BloodPressure'].str.split('/', expand = True) # Split high and low pressure
-df[['Pressure_high', 'Pressure_low']] = split_values.astype(int) # Attach these two columns to df
+df[['systolic_bp', 'diastolic_bp']] = split_values.astype(int) # Attach these two columns to df
 
-# alerts[0]: hypertensive emergency
-# alerts[1]: monthly high
-# alerts[2]: missed reading
-alerts = [0, 0, 0] # Inicialize alerts. 0 stands for no alert while 1 stands for alert
 
-# Define hypertension thresholds
-hyperten_threshold_high = 180
-hyperten_threshold_low = 110
-# Define monthly high thresholds
-monthly_threshold_high = 140
-monthly_threshold_low = 90
 
 # Call main function and return alerts
-alerts = raise_alerts(df, 1)
+alerts = hypertension_alerts(df, 1)
 print(alerts)
